@@ -1,0 +1,516 @@
+import logging
+from concurrent.futures import ThreadPoolExecutor
+import time
+from functools import partial
+from requests.exceptions import ReadTimeout, HTTPError
+import re
+import requests
+from urllib.parse import quote
+import os
+from dotenv import load_dotenv, find_dotenv
+import csv
+import json
+from csv import DictWriter
+
+load_dotenv(find_dotenv(filename='config.env'))
+template_mapping = {}
+
+EGNYTE_API_BASE = "https://bennettpless.egnyte.com/pubapi/v1"
+CHECK_FOLDER_BASE_PATH = "Team Member Resources/IT/TestArena/Template2024FolderTest12"
+TEMPLATE_FOLDER_BASE_PATH = "Team Member Resources/IT/ProjectFolderTemplates"
+TEMPLATE_GUIDE = "TemplateGuide.csv"
+BASE_URL = "https://bennett-pless.acumatica.com"
+LOGOFF_ENDPOINT = "/entity/auth/logout"
+
+TOKEN_CACHE_FILE = 'egnyte_token_cache.json'
+logging.basicConfig(filename='application.log',
+                    filemode='a',
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                    level=logging.INFO)
+
+current_year_prefix = '24'
+
+department_mapping = {
+    "00": "Atlanta",
+    "01": "Corporate",
+    "02": "Nashville",
+    "03": "Florida",
+    "04": "Knoxville",
+    "05": "Chattanooga",
+    "06": "Sarasota",
+    "07": "Charlotte",
+    "08": "Raleigh",
+    "09": "Minneapolis",
+}
+
+def authenticate():
+    base_url = "https://bennett-pless.acumatica.com/identity/connect/token"
+    client_id = os.getenv("ACUMATICA_CLIENT_ID")
+    client_secret = os.getenv("ACUMATICA_CLIENT_SECRET")
+    username = os.getenv("ACUMATICA_USERNAME")
+    password = os.getenv("ACUMATICA_PASSWORD")
+    
+
+    payload = {
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'username': username,
+        'password': password,
+        'grant_type': 'password',
+        'scope': 'api'
+    }
+    headers = {
+        'Content-Type': 'application/x-www-form-urlencoded'
+    }
+
+    response = requests.post(base_url, data=payload, headers=headers)
+    if response.status_code == 200:
+        return response.json()['access_token']
+    else:
+        print(f"Response Code: {response.status_code}")
+        print(f"Response Text: {response.text}")
+        raise Exception("Failed to authenticate with Acumatica")
+    
+def logoff_acumatica(token):
+    headers = {
+        'Authorization': f'Bearer {token}'
+    }
+    response = requests.post(f"{BASE_URL}{LOGOFF_ENDPOINT}", headers=headers)
+    if response.status_code == 204:
+        print("Logoff successful!")
+    elif response.status_code == 200:
+        print("Logoff successful!")
+    else:
+        print(f"Error {response.status_code} logging off: {response.text}")
+    
+
+def load_token_from_file():
+    try:
+        with open(TOKEN_CACHE_FILE, 'r') as file:
+            token_data = json.load(file)
+            return token_data
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_token_to_file(token_data):
+    with open(TOKEN_CACHE_FILE, 'w') as file:
+        json.dump(token_data, file)
+
+def authenticate_egnyte(retry_count=0):
+    current_time = time.time()
+    token_data = load_token_from_file()
+
+    if token_data.get('access_token') and (current_time - token_data.get('timestamp', 0) < 3500):
+        print("Using cached token...")
+        return token_data['access_token']
+
+    if retry_count >= 3:
+        print("Maximum authentication retries exceeded.")
+        return None
+
+    print("Pausing before authenticating to mitigate rate limit risks...")
+    time.sleep(5)
+
+    url = "https://bennettpless.egnyte.com/puboauth/token"
+    payload = {
+        'client_id': os.getenv("EGNYTE_CLIENT_ID"),
+        'client_secret': os.getenv("EGNYTE_CLIENT_SECRET"),
+        'username': os.getenv("EGNYTE_USERNAME"),
+        'password': os.getenv("EGNYTE_PASSWORD"),
+        'grant_type': 'password'
+    }
+
+    try:
+        response = requests.post(url, data=payload)
+        response.raise_for_status()
+        token_info = response.json()
+        token_data = {
+            'access_token': token_info.get('access_token'),
+            'timestamp': current_time
+        }
+        save_token_to_file(token_data)
+        print("Token refreshed and cached.")
+        return token_data['access_token']
+    except requests.exceptions.HTTPError as http_err:
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", 60))
+            print(f"Rate limit exceeded. Retry after {retry_after} seconds.")
+            time.sleep(retry_after)
+            return authenticate_egnyte(retry_count + 1)
+        else:
+            print(f"HTTP error occurred: {http_err}")
+            print(f"Response was: {response.text}")
+    except Exception as err:
+        print(f"An error occurred: {err}")
+
+    return None
+
+def retrieve_project_data():
+    token = authenticate()
+    api_url = "https://bennett-pless.acumatica.com/entity/BPAcumaticav2/22.200.001/Project?$expand=Attributes"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    response = requests.get(api_url, headers=headers)
+    print(f"Status Code: {response.status_code}")
+    if not response.text.strip():
+        print("No content received in response.")
+        return []
+
+    print(f"Raw Response: {response.text[:500]}")
+
+    if response.status_code == 200:
+        try:
+            projects_data = response.json()
+
+            projects_list = projects_data.get('value', []) if isinstance(projects_data, dict) else projects_data
+            project_folder_names = []
+
+            for project in projects_list:
+                logging.info(f"Project Data: {project}")
+
+                project_id = project.get('ProjectID', {}).get('value', 'UNKNOWN_PROJECT_ID')
+                client_customer_id = project.get('ClientCustomerID', {}).get('value', 'No Client Customer ID')
+                project_id_client = project.get('ProjectIDClient', {}).get('value', 'No Project ID Client')
+                project_name = project.get('ProjectIDProjectName', {}).get('value', 'NO_PROJECT_NAME')
+                status = project.get('Status', {}).get('value', 'UNKNOWN')
+                branch = project.get('branch', {}).get('value', 'UNKNOWN')
+                egnyte_folder_status = project.get('EgnyteFolder', {}).get('value', 'UNKNOWN')
+                master_project_name = project.get('MasterProjectName', {}).get('value', 'NOT_AVAILABLE')
+                master_project_true = str(project.get('MasterProjectTrue', {}).get('value', 'False'))
+                add_to_existing_series = str(project.get('AddToExistingSeries', {}).get('value', 'False'))
+                department_description = project.get('DepartmentDescription', {}).get('value', 'UNKNOWN')
+                contract_amount_value = project.get('ContractAmount', {}).get('value')
+                contract_amount = float(contract_amount_value) if contract_amount_value not in [None, '', 'unknown'] else 0
+                market = project.get('Market', {}).get('value', 'UNKNOWN')
+                sub_market = project.get('SubMarket', {}).get('value', 'UNKNOWN')
+                service_type = project.get('ServiceType', {}).get('value', 'UNKNOWN')
+                logging.info(f"During Acumatica.py Retrieve_Project_data, The MasterProjectTrue value for Project '{project_id}': {master_project_true}")
+                logging.info(f"During Acumatica.py Retrieve_Project_data, The AddToExistingSeries value for Project '{project_id}': {add_to_existing_series}")
+                folder_name = f"{project_id} - {client_customer_id} - {project_name}"
+                project_folder_names.append({
+                    'ProjectID': project_id,
+                    'folder_name': folder_name,
+                    'department_description': department_description,
+                    'contract_amount': contract_amount,
+                    'market': market,
+                    'sub_market': sub_market,
+                    'service_type': service_type,
+                    'status': status,
+                    'branch': branch,
+                    'egnyte_folder_status': egnyte_folder_status,
+                    'master_project_true': master_project_true,
+                    'master_project_name': master_project_name,
+                    'add_to_existing_series': add_to_existing_series,
+                    'project_id_client': project_id_client,
+                    'project_name': project_name,
+                    'client_customer_id': client_customer_id,
+                })
+
+            save_to_csv(projects_list)
+            return project_folder_names
+
+        except json.JSONDecodeError as e:
+            logging.debug(f"JSON decoding failed: {e}")
+            print(f"JSON decoding failed: {e}")
+            print("Response Text:", response.text)
+            return []
+    else:
+        print(f"Failed to retrieve project data: {response.status_code}")
+        print(f"Response Text: {response.text}")
+        return []
+
+def process_series_project(project_attributes, egnyte_token, department_mapping):
+    logging.info(f"Processing series project: {project_attributes['ProjectID']}")
+    print(f"Processing series project: {project_attributes['ProjectID']}")
+
+    series_project_id = project_attributes['ProjectID']
+    series_project_client_id = project_attributes['ProjectClientID']
+    series_project_name = project_attributes['ProjectIDProjectName']
+    
+    master_project_id = project_attributes['MasterProjectName']
+    master_project_client_id = project_attributes['ClientCustomerID']
+    master_project_name = project_attributes['ProjectName']
+    department_code = project_attributes['department_code']
+    department = project_attributes['department_folder']
+
+    logging.info(f"Series Project ID: {series_project_id}, Client ID: {series_project_client_id}, Project Name: {series_project_name}")
+    logging.info(f"Master Project ID: {master_project_id}, Master Client ID: {master_project_client_id}, Master Project Name: {master_project_name}, Department: {department}, Department Code: {department_code}")
+    print(f"Series Project ID: {series_project_id}, Client ID: {series_project_client_id}, Project Name: {series_project_name}")
+    print(f"Master Project ID: {master_project_id}, Master Client ID: {master_project_client_id}, Master Project Name: {master_project_name}, Department: {department}, Department Code: {department_code}")
+
+    master_project_folder_path = f"{CHECK_FOLDER_BASE_PATH}/{department}/{master_project_id} - {master_project_client_id} - {master_project_name}"
+    series_project_folder_path = f"{CHECK_FOLDER_BASE_PATH}/{department}/{series_project_id} - {series_project_client_id} - {series_project_name}"
+
+    if not check_folder_exists(egnyte_token, master_project_folder_path):
+        logging.error(f"Master project folder {master_project_folder_path} does not exist.")
+        return
+
+    if check_folder_exists(egnyte_token, series_project_folder_path):
+        logging.info(f"Series project folder {series_project_folder_path} already exists under {master_project_folder_path}.")
+        return
+
+    template_folder_name = determine_template_path(project_attributes)
+
+    copy_destination_path = f"{master_project_folder_path}/{series_project_folder_path}"
+    if copy_folder(template_folder_name, copy_destination_path, egnyte_token):
+        logging.info(f"Series project folder {series_project_folder_path} successfully created under {master_project_folder_path}.")
+    else:
+        logging.error(f"Failed to create series project folder {series_project_folder_path} under {master_project_folder_path}.")
+
+def save_to_csv(projects, filename='projects.csv'):
+    headers = ['ProjectID', 'Status', 'Branch', 'ProjectTemplateID', 'Customer', 'Description', 'MasterProjectTrue', 'EgnyteFolder', 'AddToExistingSeries', 'MasterProjectName']
+    
+    with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=headers)
+        writer.writeheader()
+
+        for project in projects:
+
+            master_project_true_value = str(project.get('MasterProjectTrue', 'False')) 
+            egnyte_folder_status = project.get('EgnyteFolder', 'Unknown')
+            add_to_existing_series_value = str(project.get('AddToExistingSeries', 'False'))
+
+            writer.writerow({
+                'ProjectID': project.get('ProjectID', {}).get('value', ''),
+                'Status': project.get('Status', {}).get('value', ''),
+                'Branch': project.get('Branch', {}).get('value', ''),
+                'ProjectTemplateID': project.get('ProjectTemplateID', {}).get('value', ''),
+                'Customer': project.get('Customer', {}).get('value', ''),
+                'Description': project.get('Description', {}).get('value', ''),
+                'MasterProjectName': project.get('MasterProjectName', {}).get('value', ''),
+                'MasterProjectTrue': master_project_true_value,
+                'EgnyteFolder': egnyte_folder_status,
+                'AddToExistingSeries': add_to_existing_series_value,
+            })
+
+def export_projects_to_csv():
+    projects = retrieve_project_data()
+    if projects:
+        save_to_csv(projects)
+
+def check_folder_exists(egnyte_token, folder_name):
+    check_url = f"{EGNYTE_API_BASE}/fs/shared/{CHECK_FOLDER_BASE_PATH}/{folder_name}"
+
+    headers = {
+        "Authorization": f"Bearer {egnyte_token}"
+    }
+
+    response = requests.get(check_url, headers=headers)
+    print(f"Checking if folder exists: {check_url}")
+    if response.status_code == 200:
+        print(f"Folder '{folder_name}' already exists.")
+        return True
+    elif response.status_code == 404:
+        return False
+    else:
+        print(f"Failed to check folder: {response.status_code}")
+        print(f"Response Text: {response.text}")
+        return None
+
+
+'''def check_master_folder_exists(egnyte_token, department, master_project_id, master_project_client_id, master_project_name):
+    folder_name = f"{department}/{master_project_id} - {master_project_client_id} - {master_project_name}"
+    check_url = f"{EGNYTE_API_BASE}/fs/shared/{CHECK_FOLDER_BASE_PATH}/{folder_name}"
+
+    headers = {"Authorization": f"Bearer {egnyte_token}"}
+
+    response = requests.get(check_url, headers=headers)
+    print(f"Checking if master project folder exists: {check_url}")
+    if response.status_code == 200:
+        print(f"Master project folder '{folder_name}' already exists.")
+        return True
+    elif response.status_code == 404:
+        return False
+    else:
+        print(f"Failed to check master project folder: {response.status_code}")
+        print(f"Response Text: {response.text}")
+        return None'''
+
+    
+def load_template_mapping(template_guide_path='TemplateGuide.csv'):
+    global template_mapping
+    with open(template_guide_path, mode='r', encoding='utf-8-sig') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            condition_set = row['ConditionSet'].strip()
+            template_name = row['TemplateName'].strip()
+            template_mapping[condition_set] = template_name
+
+def determine_template_path(project_attributes):
+    global template_mapping
+    if not template_mapping:
+        load_template_mapping()
+
+    logging.info(f"During Egnyte.py Determine Template Path, The master_project_true value for Project '{project_attributes['folder_name']}', is {project_attributes['master_project_true']}")
+
+    if project_attributes['master_project_true'] == 'True':
+        selected_template = 'ConditionSet11'
+    elif project_attributes['add_to_existing_series'] == 'True':
+        selected_template = 'ConditionSet12'
+    elif project_attributes['department_description'] == 'Raleigh':
+        selected_template = 'ConditionSet1'
+    elif project_attributes['department_description'] == 'Charlotte':
+        selected_template = 'ConditionSet2'
+    elif project_attributes['contract_amount'] < 7500.00:
+        selected_template = 'ConditionSet3'
+    elif (project_attributes['market'] == 'Infrastructure' and project_attributes['sub_market'] == 'Telecom Structures (towers, rooftops)'):
+        selected_template = 'ConditionSet4'
+    elif (project_attributes['service_type'] == 'Adaptive Re-Use (incl. historic reno)' and project_attributes['contract_amount'] > 7500.00):
+        selected_template = 'ConditionSet5'
+    elif (project_attributes['service_type'] == 'Existing Analysis' and project_attributes['contract_amount'] > 7500.00):
+        selected_template = 'ConditionSet6'
+    elif (project_attributes['service_type'] == 'Existing Assessment' and project_attributes['contract_amount'] > 7500.00):
+        selected_template = 'ConditionSet7'
+    elif (project_attributes['service_type'] == 'New - Design-Bid-Build (incl. design and CA)' and project_attributes['contract_amount'] > 7500.00):
+        selected_template = 'ConditionSet8'
+    elif (project_attributes['service_type'] == 'New - Design-Build (incl. fabricator/erector)' and project_attributes['contract_amount'] > 7500.00):
+        selected_template = 'ConditionSet9'
+    elif (project_attributes['service_type'] == 'Special (i.e. IDD, B&P as Prime)' and project_attributes['contract_amount'] > 7500.00):
+        selected_template = 'ConditionSet10'
+    else:
+        selected_template = 'Null/(empty)'
+
+    logging.info(f"Project '{project_attributes['folder_name']}', master_project_true: {project_attributes['master_project_true']}, Attributes: {project_attributes}, Template Selected: '{selected_template}'")
+
+    return template_mapping.get(selected_template, template_mapping['Null/(empty)'])
+
+
+def copy_folder(folder_name, project_attributes, egnyte_token):
+    
+    template_folder_name = determine_template_path(project_attributes)
+    print(f"Selected Template Folder Name: {template_folder_name}")
+
+    template_folder_name = determine_template_path(project_attributes)
+    source_path = f"/Shared/{TEMPLATE_FOLDER_BASE_PATH}/{template_folder_name}"
+    destination_path = f"/Shared/{CHECK_FOLDER_BASE_PATH}/{folder_name}"
+    
+    print(f"Attempting to copy from source: {source_path}")
+    print(f"Attempting to copy to destination: {destination_path}")
+
+    copy_url = f"{EGNYTE_API_BASE}/fs{source_path}"
+    
+    headers = {
+        "Authorization": f"Bearer {egnyte_token}",
+        "Content-Type": "application/json"
+    }
+    
+    data = {
+        "action": "copy",
+        "destination": destination_path,
+        "permissions": "keep_original"
+    }
+
+    attempt_count = 0
+    max_attempts = 2
+    timeout = 30
+
+    while attempt_count < max_attempts:
+        try:
+            response = requests.post(copy_url, headers=headers, json=data, timeout=timeout)
+            response.raise_for_status()
+            print(f"Folder copied successfully to {folder_name}")
+            return True
+        except ReadTimeout:
+            print(f"Attempt {attempt_count + 1} timed out. Trying again...")
+            attempt_count += 1
+        except HTTPError as http_err:
+            print(f"HTTP error occurred: {http_err} - {response.text}")
+            return False
+        except Exception as err:
+            print(f"An error occurred: {err}")
+            return False
+
+    print(f"Failed to copy folder after {max_attempts} attempts.")
+    return False
+
+def rename_folder(egnyte_token, old_path, new_folder_name):
+    url = f"https://bennettpless.egnyte.com/pubapi/v1/fs/{old_path}"
+    
+    headers = {
+        "Authorization": f"Bearer {egnyte_token}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "action": "move",
+        "destination": f"{new_folder_name}"
+    }
+    
+    response = requests.post(url, headers=headers, json=data)
+    
+    if response.status_code in [200, 201]:
+        print(f"Folder renamed successfully to {new_folder_name}")
+        return True
+    else:
+        print(f"Failed to rename folder. Status Code: {response.status_code}, Response: {response.text}")
+        return False
+
+
+def process_project(project, egnyte_token):
+    logging.info(f"Processing project: {project['folder_name']}")
+
+    project_id_parts = project['ProjectID'].split('.')
+    department_code = project_id_parts[1] if len(project_id_parts) > 1 else 'Unknown'
+    department_folder = department_mapping.get(department_code, 'Unknown')
+
+    folder_name = f"{department_folder}/{project['folder_name']}"
+    
+    add_to_existing_series = str(project.get('add_to_existing_series', '')).lower() == 'true'
+
+    project_attributes = {
+        'ProjectID': project['ProjectID'],
+        'ClientCustomerID': project.get('client_customer_id', 'UNKNOWN'),
+        'ProjectName': project.get('project_name', 'UNKNOWN'),
+        'MasterProjectName': project.get('master_project_name', 'UNKNOWN'),
+        'folder_name': folder_name,
+        'department_description': project['department_description'],
+        'contract_amount': project['contract_amount'],
+        'market': project['market'],
+        'sub_market': project['sub_market'],
+        'service_type': project['service_type'],
+        'master_project_true': project['master_project_true'],
+        'add_to_existing_series': add_to_existing_series,
+        'department_code': department_code,
+        'department_folder': department_folder,
+	    'ProjectClientID' : project.get('project_id_client', 'UNKNOWN'),
+        'ProjectIDProjectName' : project.get('project_name', 'UNKNOWN'),
+    }
+
+    if add_to_existing_series:
+        process_series_project(project_attributes, egnyte_token, department_mapping)
+    elif not check_folder_exists(egnyte_token, folder_name):
+        if copy_folder(folder_name, project_attributes, egnyte_token):
+            logging.info(f"Folder '{folder_name}' created successfully.")
+        else:
+            logging.error(f"Failed to create folder '{folder_name}'.")
+    else:
+        logging.info(f"Folder '{folder_name}' already exists.")
+
+
+
+
+
+def main():
+    projects_info = retrieve_project_data()
+ 
+    active_projects = [
+        project for project in projects_info
+        if project['status'].lower() == 'active'
+        and project.get('ProjectID', '').startswith(current_year_prefix)
+        and project.get('egnyte_folder_status', '').lower() != 'created'
+        and project.get('branch', '').upper() != 'BPL'
+    ]
+ 
+    egnyte_token = authenticate_egnyte()
+ 
+    for project in active_projects:
+        process_project(project, egnyte_token)
+
+if __name__ == "__main__":
+    load_template_mapping(TEMPLATE_GUIDE)
+    token = authenticate()
+    main()
+    if token:
+        logoff_acumatica(token)
